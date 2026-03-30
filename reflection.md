@@ -22,9 +22,9 @@
     - **DailyPlan** — the final output object. Responsible for holding the full result of one scheduling run: the list of successfully scheduled tasks, any tasks that couldn't be placed, an overall rationale summary, and a coverage percentage. It exposes a get_timeline() method the UI consumes directly.
 
 **b. Design changes**
-![UML](image.png)
+![UML](image-1.png)
 - Did your design change during implementation? If yes, describe at least one change and why you made it.
-    - Yes, I separate the value objects (TimeSlot, Priority, TaskCategory, Frequency) into separate class. Since they are small, reusable types, keeping them separate means a task can declare priority=Priority.CRITICAL and frequency=Frequency.TWICE_DAILY without bloating the Task class.
+    - Added DailyPlan → Pet (covers) relationship and replaced the bare List<Task> unscheduled with a new UnscheduledTask wrapper class that carries a reason field, mirroring the ScheduledTask pattern.
 ---
 
 ## 2. Scheduling Logic and Tradeoffs
