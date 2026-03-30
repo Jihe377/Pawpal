@@ -118,7 +118,8 @@ class Constraint:
     task_exclusions: list[str] = field(default_factory=list)
 
     def validate(self, scheduled: list[ScheduledTask]) -> bool:
-        """Return False if scheduled tasks violate budget, blocked slots, or exclusions."""
+        """Return False if scheduled tasks violate budget, blocked slots, exclusions,
+        or the maximum allowed consecutive minutes."""
         total_mins = sum(st.get_duration() for st in scheduled)
         if total_mins > self.max_daily_minutes:
             return False
@@ -129,6 +130,23 @@ class Constraint:
                 booked = TimeSlot(st.start_time, st.end_time)
                 if any(booked.overlaps(b) for b in self.blocked_slots):
                     return False
+
+        # Check that no contiguous run of back-to-back tasks exceeds the limit.
+        timed = sorted(
+            [st for st in scheduled if st.start_time and st.end_time],
+            key=lambda st: st.start_time,
+        )
+        consecutive = 0
+        prev_end: Optional[time] = None
+        for st in timed:
+            if prev_end is not None and st.start_time == prev_end:
+                consecutive += st.get_duration()
+            else:
+                consecutive = st.get_duration()
+            if consecutive > self.max_consecutive_mins:
+                return False
+            prev_end = st.end_time
+
         return True
 
     def get_available_slots(self, already_scheduled: list[ScheduledTask]) -> list[TimeSlot]:
@@ -390,12 +408,18 @@ class Scheduler:
         plan = DailyPlan(plan_date=plan_date, owner=owner)
         last_placed_end: dict[str, int] = {}
 
-        # Collect (task, pet) pairs from every pet
-        all_task_pet_pairs: list[tuple[Task, Pet]] = [
-            (task, pet)
-            for pet in owner.pets
-            for task in self._resolve_conflicts(pet.tasks)
-        ]
+        # Collect (task, pet) pairs from every pet; record irreconcilable conflicts
+        all_task_pet_pairs: list[tuple[Task, Pet]] = []
+        for pet in owner.pets:
+            kept, dropped = self._resolve_conflicts(pet.tasks)
+            for task in dropped:
+                plan.unscheduled.append(UnscheduledTask(
+                    task=task,
+                    reason="Irreconcilable window conflict with a higher-priority task",
+                    original_priority=task.priority,
+                ))
+            for task in kept:
+                all_task_pet_pairs.append((task, pet))
 
         # Rank all tasks together by priority across all pets
         all_task_pet_pairs.sort(
@@ -466,7 +490,14 @@ class Scheduler:
         # task_id -> end-time in minutes of its most recently placed occurrence
         last_placed_end: dict[str, int] = {}
 
-        ranked = self.rank_tasks(self._resolve_conflicts(pet.tasks))
+        kept, dropped = self._resolve_conflicts(pet.tasks)
+        for task in dropped:
+            plan.unscheduled.append(UnscheduledTask(
+                task=task,
+                reason="Irreconcilable window conflict with a higher-priority task",
+                original_priority=task.priority,
+            ))
+        ranked = self.rank_tasks(kept)
         work_list = self._expand_by_frequency(ranked)
 
         for task, occurrence_idx in work_list:
@@ -624,21 +655,27 @@ class Scheduler:
             parts.append(f"repeats {label} with ≥{gap} min between occurrences")
         return "; ".join(parts)
 
-    def _resolve_conflicts(self, tasks: list[Task]) -> list[Task]:
+    def _resolve_conflicts(self, tasks: list[Task]) -> tuple[list[Task], list[Task]]:
         """
         Drop lower-priority time-sensitive tasks whose preferred_window
         is fully blocked by a higher-priority task's window and cannot be moved.
+
+        Returns:
+            (kept, dropped) — kept tasks proceed to scheduling; dropped tasks
+            should be added to plan.unscheduled by the caller.
         """
         ranked = self.rank_tasks(tasks)
         claimed_windows: list[TimeSlot] = []
-        result: list[Task] = []
+        kept: list[Task] = []
+        dropped: list[Task] = []
         for task in ranked:
             if task.is_time_sensitive and task.preferred_window:
                 if any(task.preferred_window.overlaps(w) for w in claimed_windows):
+                    dropped.append(task)
                     continue  # irreconcilable conflict — lower priority loses
                 claimed_windows.append(task.preferred_window)
-            result.append(task)
-        return result
+            kept.append(task)
+        return kept, dropped
 
     def _compute_free_slots(self, owner: Owner, plan: DailyPlan) -> list[TimeSlot]:
         """Owner's available slots minus what the plan has already placed."""
