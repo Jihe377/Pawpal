@@ -32,12 +32,20 @@
 **a. Constraints and priorities**
 
 - What constraints does your scheduler consider (for example: time, priority, preferences)?
+    - Time (availability) — Owner.available_slots defines the window the owner can act. The scheduler only places tasks inside these slots, and each placed task shrinks the remaining free time via _subtract_booked.
+    - Priority — Priority (CRITICAL → HIGH → MEDIUM → LOW) and is_time_sensitive are the primary sort keys in rank_tasks. Higher-priority tasks claim slots before lower-priority ones can.
+    - Preferred window — Task.preferred_window is a soft preference. find_best_slot actively looks for a free slot that overlaps the window; it only falls back to any available slot if none overlap.
+    - Minimum gap between occurrences — _MIN_GAP_MINS enforces spacing between recurrences of the same task (e.g. 4 hours between TWICE_DAILY feedings), trimming free slots with _trim_slots_before.
+    - Duration fit — a slot is only considered a candidate if slot.duration_mins >= task.duration_mins.
 - How did you decide which constraints mattered most?
+    - Time availability is the hard constraint — without a free slot nothing can be placed at all, so it's checked first. Priority and is_time_sensitive are the deciding factors when multiple tasks compete for the same window; a missed CRITICAL task (medication, feeding) has real consequences for the pet, so it must win over a LOW task (grooming) every time. Preferred window is intentionally soft — pet care tasks have natural rhythms (morning walk, evening feeding) that the schedule should respect when possible, but an owner's limited availability matters more than perfect timing. Minimum gaps are a correctness constraint specific to multi-daily tasks and only apply to those frequencies.
 
 **b. Tradeoffs**
 
 - Describe one tradeoff your scheduler makes.
+    - The scheduler uses a greedy, first-fit algorithm — it sorts tasks by priority once, then places each task into the earliest available slot that fits, never revisiting earlier decisions.
 - Why is that tradeoff reasonable for this scenario?
+    - Pet care scheduling has a small, bounded task list (typically under 20 tasks per day) with hard owner availability as the primary constraint. A greedy approach produces a correct, actionable schedule in linear time without the complexity of backtracking or exhaustive search. The cost of the tradeoff — a suboptimal arrangement where a high-priority task placed early blocks a slot that could have fit two lower-priority tasks — is low in practice, because rank_tasks already ensures the most critical tasks (CRITICAL priority, is_time_sensitive=True) claim their preferred windows first. For this domain, a "good enough in milliseconds" schedule is far more useful to an owner than a mathematically optimal one that takes seconds to compute.
 
 ---
 
