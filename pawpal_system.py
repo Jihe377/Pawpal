@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from datetime import time, date
+from datetime import time, date, timedelta
 from enum import Enum
 from typing import Optional
 import uuid
@@ -45,6 +45,21 @@ def _time_to_mins(t: time) -> int:
 
 def _mins_to_time(m: int) -> time:
     return time(m // 60, m % 60)
+
+
+def _trim_slots_before(slots: list[TimeSlot], earliest_mins: int) -> list[TimeSlot]:
+    """Drop or trim slots so none start before earliest_mins."""
+    result = []
+    for s in slots:
+        s_end = _time_to_mins(s.end)
+        if s_end <= earliest_mins:
+            continue
+        s_start = _time_to_mins(s.start)
+        if s_start < earliest_mins:
+            result.append(TimeSlot(_mins_to_time(earliest_mins), s.end))
+        else:
+            result.append(s)
+    return result
 
 
 def _subtract_booked(slots: list[TimeSlot], booked: TimeSlot) -> list[TimeSlot]:
@@ -139,9 +154,47 @@ class Task:
     is_time_sensitive: bool = False
     is_completed: bool = False
     notes: str = ""
+    due_date: Optional[date] = None
 
-    def mark_complete(self) -> None:
+    # How many days until the next occurrence for each frequency.
+    # timedelta(days=n) shifts a date forward by exactly n days,
+    # correctly handling month boundaries and leap years.
+    _RECURRENCE_DAYS: dict = field(default_factory=lambda: {
+        Frequency.ONCE_DAILY:        timedelta(days=1),
+        Frequency.TWICE_DAILY:       timedelta(days=1),
+        Frequency.THREE_TIMES_DAILY: timedelta(days=1),
+        Frequency.WEEKLY:            timedelta(weeks=1),  # timedelta(weeks=1) == timedelta(days=7)
+    })
+
+    def mark_complete(self) -> Optional[Task]:
+        """Mark this task done and return a fresh Task for the next occurrence.
+
+        Returns:
+            A new Task with a reset is_completed and an updated due_date,
+            or None if the frequency is AS_NEEDED (no automatic recurrence).
+        """
         self.is_completed = True
+
+        delta = self._RECURRENCE_DAYS.get(self.frequency)
+        if delta is None:           # AS_NEEDED — caller decides if/when to reschedule
+            return None
+
+        # date.today() + timedelta gives the concrete calendar date of the next run.
+        # Example: today=2026-03-29, daily  → 2026-03-30
+        #          today=2026-03-29, weekly → 2026-04-05
+        next_due = (self.due_date or date.today()) + delta
+
+        return Task(
+            name=self.name,
+            category=self.category,
+            duration_mins=self.duration_mins,
+            priority=self.priority,
+            frequency=self.frequency,
+            preferred_window=self.preferred_window,
+            is_time_sensitive=self.is_time_sensitive,
+            notes=self.notes,
+            due_date=next_due,
+        )
 
     def validate(self) -> bool:
         """Return True if the task is internally consistent."""
@@ -188,6 +241,30 @@ class Owner:
 
     def remove_pet(self, pet_id: str) -> None:
         self.pets = [p for p in self.pets if p.pet_id != pet_id]
+
+    def filter_tasks(
+        self,
+        *,
+        is_completed: Optional[bool] = None,
+        pet_name: Optional[str] = None,
+    ) -> list[Task]:
+        """Return tasks across all pets, optionally filtered by completion status or pet name.
+
+        Args:
+            is_completed: if True, return only completed tasks; if False, only incomplete.
+                          if None, completion status is not filtered.
+            pet_name:     if given, return only tasks belonging to that pet (case-insensitive).
+                          if None, tasks from all pets are included.
+        """
+        results: list[Task] = []
+        for pet in self.pets:
+            if pet_name is not None and pet.name.lower() != pet_name.lower():
+                continue
+            for task in pet.tasks:
+                if is_completed is not None and task.is_completed != is_completed:
+                    continue
+                results.append(task)
+        return results
 
     def get_free_time(self, already_scheduled: list[ScheduledTask]) -> list[TimeSlot]:
         """Owner's available_slots minus time already occupied by scheduled tasks."""
@@ -340,7 +417,7 @@ class Scheduler:
 
             if last_end is not None and min_gap > 0:
                 earliest_start = last_end + min_gap
-                free_slots = [s for s in free_slots if _time_to_mins(s.start) >= earliest_start]
+                free_slots = _trim_slots_before(free_slots, earliest_start)
 
             best_slot = self.find_best_slot(task, free_slots)
 
@@ -400,10 +477,7 @@ class Scheduler:
             # Enforce minimum spacing between occurrences of the same task
             if last_end is not None and min_gap > 0:
                 earliest_start = last_end + min_gap
-                free_slots = [
-                    s for s in free_slots
-                    if _time_to_mins(s.start) >= earliest_start
-                ]
+                free_slots = _trim_slots_before(free_slots, earliest_start)
 
             best_slot = self.find_best_slot(task, free_slots)
 
@@ -441,12 +515,70 @@ class Scheduler:
         plan.overall_reasoning = self._summarize_plan(plan, pet)
         return plan
 
+    def detect_conflicts(
+        self, scheduled: list[ScheduledTask]
+    ) -> list[tuple[ScheduledTask, ScheduledTask]]:
+        """Return every pair of scheduled tasks whose time slots overlap.
+
+        Checks all combinations (same pet or different pets), since the owner
+        can only be in one place at a time. A pair (a, b) appears once — never
+        as both (a, b) and (b, a).
+        """
+        conflicts: list[tuple[ScheduledTask, ScheduledTask]] = []
+        for i, a in enumerate(scheduled):
+            # Skip tasks with no time information — they can't be compared
+            if not (a.start_time and a.end_time):
+                continue
+            slot_a = TimeSlot(a.start_time, a.end_time)
+
+            for b in scheduled[i + 1:]:          # i+1 avoids duplicates and self-comparison
+                if not (b.start_time and b.end_time):
+                    continue
+                slot_b = TimeSlot(b.start_time, b.end_time)
+
+                if slot_a.overlaps(slot_b):
+                    conflicts.append((a, b))
+
+        return conflicts
+
+    def warn_conflicts(self, scheduled: list[ScheduledTask]) -> list[str]:
+        """Return human-readable warning strings for every overlapping task pair.
+
+        Returns an empty list when there are no conflicts — no exceptions raised,
+        no program crash. The caller decides what to do with the warnings.
+        """
+        warnings: list[str] = []
+        for a, b in self.detect_conflicts(scheduled):
+            pet_a  = a.pet.name  if a.pet  else "unknown pet"
+            pet_b  = b.pet.name  if b.pet  else "unknown pet"
+            task_a = a.task.name if a.task else "unknown task"
+            task_b = b.task.name if b.task else "unknown task"
+            start_a = a.start_time.strftime("%H:%M") if a.start_time else "?"
+            end_a   = a.end_time.strftime("%H:%M")   if a.end_time   else "?"
+            start_b = b.start_time.strftime("%H:%M") if b.start_time else "?"
+            end_b   = b.end_time.strftime("%H:%M")   if b.end_time   else "?"
+            warnings.append(
+                f"WARNING: '{task_a}' [{pet_a}] {start_a}–{end_a} "
+                f"overlaps '{task_b}' [{pet_b}] {start_b}–{end_b}"
+            )
+        return warnings
+
     def rank_tasks(self, tasks: list[Task]) -> list[Task]:
         """Sort tasks: time-sensitive first, then priority descending."""
         return sorted(
             tasks,
             key=lambda t: (t.is_time_sensitive, t.priority.value),
             reverse=True,
+        )
+
+    def sort_by_time(self, tasks: list[Task]) -> list[Task]:
+        """Sort tasks by preferred_window start time ascending.
+        Tasks without a preferred_window are placed at the end."""
+        return sorted(
+            tasks,
+            key=lambda t: (
+                t.preferred_window.start if t.preferred_window else time(23, 59)
+            ),
         )
 
     def score_slot(self, task: Task, slot: TimeSlot, owner: Owner) -> float:
